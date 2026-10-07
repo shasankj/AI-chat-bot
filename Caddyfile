@@ -1,0 +1,6 @@
+{$SITE_ADDRESS} {
+	# flush_interval -1: send SSE chat tokens to the browser immediately instead of buffering them.
+	reverse_proxy app:8000 {
+		flush_interval -1
+	}
+}
