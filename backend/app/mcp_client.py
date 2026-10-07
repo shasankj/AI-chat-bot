@@ -9,6 +9,7 @@ The MCP server trusts its caller (like any internal service). So THIS layer guar
 """
 import asyncio
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,7 @@ from typing import Any
 
 from mcp import Client, StdioServerParameters
 
+from app.config import Settings
 from app.guardrails.fencing import ContextItem
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -25,8 +27,12 @@ IDENTITY_FIELD = "member_id"
 
 def stdio_server_params() -> StdioServerParameters:
     """Launch our MCP server as a child process, speaking over its stdin/stdout."""
+    # The MCP client hands a child only a tiny allow-list (PATH, HOME, ...), so config that comes from the
+    # real environment (containers, CI) would be invisible to it. Forward our own settings explicitly;
+    # locally the child would also find backend/.env on disk, which is why this only broke in a container.
+    env = {name.upper(): os.environ[name.upper()] for name in Settings.model_fields if name.upper() in os.environ}
     return StdioServerParameters(command=sys.executable, args=["-m", "mcp_server.server"],
-                                 cwd=str(BACKEND_DIR))
+                                 cwd=str(BACKEND_DIR), env=env)
 
 
 @dataclass(frozen=True)
