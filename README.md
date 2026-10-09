@@ -9,6 +9,8 @@ has no evidence, and **never gives medical advice**. It combines three kinds of 
 | **FDA drug labels** (13 PDFs) | General drug information: labeled side effects, warnings, uses, interactions | RAG with metadata filters (drug mode) |
 | **Patient records** (PostgreSQL) | Exact facts: a patient's prescriptions, copays, tiers, plan | MCP server (4 read-only tools) |
 
+**Live demo (hosted on AWS EC2):** https://3-135-57-21.sslip.io/ · **Case study:** [portfolio write-up with an animated architecture diagram](https://shasankj.github.io/portfolio/projects/care-bot/)
+
 > **Learning the system?** Read [`docs/WORKBOOK.md`](docs/WORKBOOK.md): every concept, every decision and its alternatives,
 > the problems we hit and how we fixed them, the measurements, and interview preparation.
 >
@@ -40,15 +42,18 @@ has no evidence, and **never gives medical advice**. It combines three kinds of 
 5. [Safety and security model](#safety-and-security-model)
 6. [Roles](#roles)
 7. [Sample questions by role](#sample-questions-by-role)
-8. [Setup and run](#setup-and-run)
-9. [Ingestion](#ingestion)
-10. [Testing and evaluation](#testing-and-evaluation)
-11. [API reference](#api-reference)
-12. [Project layout](#project-layout)
-13. [Troubleshooting](#troubleshooting)
-14. [Known limitations](#known-limitations)
-15. [Roadmap](#roadmap)
-16. [Data sources](#data-sources)
+8. [Quick start](#quick-start)
+9. [Setup and run](#setup-and-run)
+10. [Environment variables](#environment-variables)
+11. [Ingestion](#ingestion)
+12. [Testing and evaluation](#testing-and-evaluation)
+13. [Deployment](#deployment)
+14. [API reference](#api-reference)
+15. [Project layout](#project-layout)
+16. [Troubleshooting](#troubleshooting)
+17. [Known limitations](#known-limitations)
+18. [Roadmap](#roadmap)
+19. [Data sources](#data-sources)
 
 ---
 
@@ -247,6 +252,16 @@ records I have access to."*, and an emergency message pointing to 911 / 988 for 
 | What is the capital of France? | "I don't know" |
 | What prescriptions does James Okafor have? *(as Maria)* | Fixed refusal: "I can only share information about the patient who is signed in or selected…"; never any of James's data |
 
+## Quick start
+
+Three commands, once the database exists and is loaded (the one-time steps 4 and 5 under [Setup and run](#setup-and-run)):
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install --only-binary=cryptography -r backend/requirements.txt && npm --prefix frontend install
+cp backend/.env.example backend/.env      # then fill in the values: see "Environment variables"
+./dev.sh                                  # backend :8000 + frontend :5173 -> http://localhost:5173
+```
+
 ## Setup and run
 
 **Prerequisites:** Python 3.11+ (developed on 3.13), Node 20+ (developed on 24), a PostgreSQL database with the
@@ -262,18 +277,9 @@ python3 -m venv .venv
 # 2) Frontend packages
 cd frontend && npm install && cd ..
 
-# 3) Configuration: create backend/.env
+# 3) Configuration: cp backend/.env.example backend/.env and fill it in (see "Environment variables")
 ```
 
-`backend/.env`
-```
-DATABASE_URL=postgresql+psycopg://APP_ROLE:PASSWORD@HOST:5432/DB?sslmode=require        # restricted app role
-OWNER_DATABASE_URL=postgresql+psycopg://OWNER_ROLE:PASSWORD@HOST:5432/DB?sslmode=require # used only by setup scripts
-ANTHROPIC_API_KEY=sk-ant-...
-LLM_MODEL=claude-haiku-4-5-20251001
-SESSION_SECRET=<python -c "import secrets; print(secrets.token_urlsafe(48))">
-# optional: SESSION_HOURS=8  COOKIE_SECURE=true (behind HTTPS)  CORS_ORIGINS=http://localhost:5173
-```
 Both database roles must default to the `healthbot` schema (`ALTER ROLE ... SET search_path = healthbot, public`).
 
 ```bash
@@ -296,6 +302,23 @@ Manual start (two terminals): `cd backend && ../.venv/bin/uvicorn app.main:app -
 `cd frontend && npm run dev`.
 
 Terminal chat without the UI: `cd backend && ../.venv/bin/python -m scripts.chat_cli HSC-400005`
+
+## Environment variables
+
+Set in `backend/.env` (copy `backend/.env.example`; the real file is git-ignored and must never be committed). The app reads them in one place, `backend/app/config.py`, and fails fast at startup if a required one is missing.
+
+| Variable | Required | Description |
+|---|---|---|
+| `DATABASE_URL` | yes | SQLAlchemy URL of the **restricted** role: read-only on data tables, insert-only on the audit table. Used by the chatbot, retriever and MCP server. |
+| `OWNER_DATABASE_URL` | yes | URL of the owner role that can create tables. Used **only** by the setup and ingestion scripts, never by the running app. |
+| `ANTHROPIC_API_KEY` | yes | Anthropic API key for Claude Haiku. |
+| `LLM_MODEL` | no | Model id. Default `claude-haiku-4-5-20251001`. |
+| `SESSION_SECRET` | recommended | Signs the session cookie (HS256). If unset, a random one is generated at startup and everyone is signed out on every restart. Generate with `python -c "import secrets; print(secrets.token_urlsafe(48))"`. |
+| `SESSION_HOURS` | no | Session lifetime in hours. Default `8`. |
+| `COOKIE_SECURE` | no | `true` when served over HTTPS. Default `false`. Docker Compose sets it for you. |
+| `CORS_ORIGINS` | no | Comma-separated allowed origins for the CSRF Origin check and CORS. Default is the local Vite dev server. Docker Compose sets it from `SITE_ADDRESS`. |
+| `FRONTEND_DIST` | no | Path to the built frontend served by `asgi_prod.py`. Defaults to `frontend/dist`. |
+| `SITE_ADDRESS` | deploy only | Public hostname for Caddy and the Origin check. Passed on the command line to `docker compose` (see [Deployment](#deployment)), not stored in `.env`. |
 
 ## Ingestion
 
@@ -351,6 +374,35 @@ cd ../frontend && npm test && npx tsc -b && npx oxlint && npm run build
 | **Live end-to-end evaluation (real model), 37 cases** | **37 / 37** |
 | Latency | refusals ~0.1 s (no model call); answers 2.5–6 s |
 
+## Deployment
+
+Production runs as one container behind Caddy on a single EC2 host: one origin, automatic HTTPS, no CORS or cookie gymnastics.
+
+```
+browser --HTTPS--> Caddy (TLS, SSE-safe proxy) --> app container: uvicorn asgi_prod:app
+                                                    /api/*  -> the FastAPI app (prefix stripped, like Vite's dev proxy)
+                                                    /*      -> the built React app (frontend/dist)
+                                                    + MCP server as a child process, embedding model baked into the image
+                                                    --> PostgreSQL + pgvector (not in the container)
+```
+
+On the host (Docker with the Compose plugin installed, `backend/.env` present, the database already migrated and ingested):
+
+```bash
+SITE_ADDRESS=<your-host>.sslip.io docker compose up -d --build
+```
+
+What this does and why:
+
+* **`Dockerfile`**: multi-stage. Stage 1 builds the React app; stage 2 installs the Python dependencies, copies the backend and the built frontend, and **bakes the embedding model into the image (about 210 MB)** so startup never waits on a download. The app runs as a **non-root** user.
+* **`asgi_prod.py`**: serves `/api/*` and the static frontend from one process, forwards the lifespan to the API app (it starts the MCP subprocess and loads the embedding model), and exposes `GET /healthz`, a cheap liveness probe that does not touch the database. `/api/health` reports database, MCP and audit status.
+* **`docker-compose.yml`**: reads `backend/.env`, sets `COOKIE_SECURE=true` and `CORS_ORIGINS=https://$SITE_ADDRESS` (the CSRF Origin check needs the exact public origin), restarts on failure, and runs a health check. The app port is exposed to Caddy only, not published to the internet.
+* **`Caddyfile`**: reverse proxy to `app:8000` with `flush_interval -1` so server-sent events reach the browser immediately instead of being buffered. The certificate is stored in a volume so it survives restarts.
+* **One worker on purpose.** Conversation memory and rate limits live in process memory, so more workers would split state. Scaling out needs the Postgres checkpointer and Redis listed in the [roadmap](#roadmap).
+* **Database reachability.** The database must accept connections from the host. Use `sslmode=require` in both URLs.
+
+Update: `git pull && SITE_ADDRESS=<your-host>.sslip.io docker compose up -d --build`. There is no CI pipeline yet; run the tests locally first ([Testing and evaluation](#testing-and-evaluation)).
+
 ## API reference
 
 | Method | Path | Role | Purpose |
@@ -385,6 +437,7 @@ backend/
 frontend/src/            api.ts, sse.ts, chatState.ts, hooks/, components/
 docs/                    WORKBOOK.md (concepts, strategies, interview prep), screenshots/
 dev.sh                   one-command launcher
+Dockerfile, docker-compose.yml, Caddyfile, backend/asgi_prod.py    production deployment
 ```
 
 ## Troubleshooting
@@ -413,7 +466,7 @@ dev.sh                   one-command launcher
 * **Coverage documents are general Medicare guidance**, not the rules of the fictional insurers in the database.
 * **Label information is a quotation of published text**, which can still be misread. It is never personalized.
 * The generic labels for metformin and omeprazole come from generic labelers (the brand labels aren't on DailyMed).
-* Not a git repository yet: run `git init` before committing (`.gitignore` is already set up).
+* **No CI pipeline yet.** Tests and evaluations are run by hand before deploying.
 
 ## Roadmap
 
